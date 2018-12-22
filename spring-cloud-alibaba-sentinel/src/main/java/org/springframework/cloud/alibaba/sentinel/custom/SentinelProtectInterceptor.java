@@ -19,10 +19,12 @@ package org.springframework.cloud.alibaba.sentinel.custom;
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.net.URI;
+import java.util.Arrays;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.cloud.alibaba.sentinel.annotation.SentinelProtect;
+import org.springframework.cloud.alibaba.sentinel.annotation.SentinelRestTemplate;
+import org.springframework.cloud.alibaba.sentinel.rest.SentinelClientHttpResponse;
 import org.springframework.http.HttpRequest;
 import org.springframework.http.client.ClientHttpRequestExecution;
 import org.springframework.http.client.ClientHttpRequestInterceptor;
@@ -31,49 +33,67 @@ import org.springframework.util.ClassUtils;
 
 import com.alibaba.csp.sentinel.Entry;
 import com.alibaba.csp.sentinel.SphU;
+import com.alibaba.csp.sentinel.Tracer;
 import com.alibaba.csp.sentinel.context.ContextUtil;
 import com.alibaba.csp.sentinel.slots.block.BlockException;
 import com.alibaba.csp.sentinel.slots.block.degrade.DegradeException;
 import com.alibaba.csp.sentinel.util.StringUtil;
 
 /**
- * Interceptor using by SentinelProtect and SentinelProtectInterceptor
+ * Interceptor using by SentinelRestTemplate
  *
  * @author fangjian
  */
 public class SentinelProtectInterceptor implements ClientHttpRequestInterceptor {
 
-    private static final Logger logger = LoggerFactory
+	private static final Logger logger = LoggerFactory
 			.getLogger(SentinelProtectInterceptor.class);
 
-	private SentinelProtect sentinelProtect;
+	private SentinelRestTemplate sentinelRestTemplate;
 
-	public SentinelProtectInterceptor(SentinelProtect sentinelProtect) {
-		this.sentinelProtect = sentinelProtect;
+	public SentinelProtectInterceptor(SentinelRestTemplate sentinelRestTemplate) {
+		this.sentinelRestTemplate = sentinelRestTemplate;
 	}
 
 	@Override
 	public ClientHttpResponse intercept(HttpRequest request, byte[] body,
 			ClientHttpRequestExecution execution) throws IOException {
 		URI uri = request.getURI();
-		String hostResource = uri.getScheme() + "://" + uri.getHost() + ":"
-				+ (uri.getPort() == -1 ? 80 : uri.getPort());
+		String hostResource = uri.getScheme() + "://" + uri.getHost()
+				+ (uri.getPort() == -1 ? "" : ":" + uri.getPort());
 		String hostWithPathResource = hostResource + uri.getPath();
+		boolean entryWithPath = true;
+		if (hostResource.equals(hostWithPathResource)) {
+			entryWithPath = false;
+		}
 		Entry hostEntry = null, hostWithPathEntry = null;
-		ClientHttpResponse response = null;
+		ClientHttpResponse response;
 		try {
 			ContextUtil.enter(hostWithPathResource);
-			hostWithPathEntry = SphU.entry(hostWithPathResource);
+			if (entryWithPath) {
+				hostWithPathEntry = SphU.entry(hostWithPathResource);
+			}
 			hostEntry = SphU.entry(hostResource);
 			response = execution.execute(request, body);
 		}
-		catch (BlockException e) {
-			logger.error("RestTemplate block", e);
-			try {
-				handleBlockException(e);
+		catch (Throwable e) {
+			if (!BlockException.isBlockException(e)) {
+				Tracer.trace(e);
+				throw new IllegalStateException(e);
 			}
-			catch (Exception ex) {
-				logger.error("sentinel handle BlockException error.", e);
+			else {
+				try {
+					return handleBlockException(request, body, execution,
+							(BlockException) e);
+				}
+				catch (Exception ex) {
+					if (ex instanceof IllegalStateException) {
+						throw (IllegalStateException) ex;
+					}
+					throw new IllegalStateException(
+							"sentinel handle BlockException error: " + ex.getMessage(),
+							ex);
+				}
 			}
 		}
 		finally {
@@ -88,21 +108,29 @@ public class SentinelProtectInterceptor implements ClientHttpRequestInterceptor 
 		return response;
 	}
 
-	private void handleBlockException(BlockException ex) throws Exception {
-		Object[] args = new Object[] { ex };
+	private ClientHttpResponse handleBlockException(HttpRequest request, byte[] body,
+			ClientHttpRequestExecution execution, BlockException ex) throws Exception {
+		Object[] args = new Object[] { request, body, execution, ex };
 		// handle degrade
 		if (isDegradeFailure(ex)) {
-			Method method = extractFallbackMethod(sentinelProtect.fallback(),
-					sentinelProtect.fallbackClass());
+			Method method = extractFallbackMethod(sentinelRestTemplate.fallback(),
+					sentinelRestTemplate.fallbackClass());
 			if (method != null) {
-				method.invoke(null, args);
+				return (ClientHttpResponse) method.invoke(null, args);
+			}
+			else {
+				return new SentinelClientHttpResponse();
 			}
 		}
 		// handle block
-		Method blockHandler = extractBlockHandlerMethod(sentinelProtect.blockHandler(),
-				sentinelProtect.blockHandlerClass());
+		Method blockHandler = extractBlockHandlerMethod(
+				sentinelRestTemplate.blockHandler(),
+				sentinelRestTemplate.blockHandlerClass());
 		if (blockHandler != null) {
-			blockHandler.invoke(null, args);
+			return (ClientHttpResponse) blockHandler.invoke(null, args);
+		}
+		else {
+			return new SentinelClientHttpResponse();
 		}
 	}
 
@@ -111,10 +139,25 @@ public class SentinelProtectInterceptor implements ClientHttpRequestInterceptor 
 			return null;
 		}
 		Method cachedMethod = BlockClassRegistry.lookupFallback(fallbackClass, fallback);
+		Class[] args = new Class[] { HttpRequest.class, byte[].class,
+				ClientHttpRequestExecution.class, BlockException.class };
 		if (cachedMethod == null) {
-			cachedMethod = ClassUtils.getStaticMethod(fallbackClass, fallback,
-					BlockException.class);
-			BlockClassRegistry.updateFallbackFor(fallbackClass, fallback, cachedMethod);
+			cachedMethod = ClassUtils.getStaticMethod(fallbackClass, fallback, args);
+			if (cachedMethod != null) {
+				if (!ClientHttpResponse.class
+						.isAssignableFrom(cachedMethod.getReturnType())) {
+					throw new IllegalStateException(String.format(
+							"the return type of method [%s] in class [%s] is not ClientHttpResponse in degrade",
+							cachedMethod.getName(), fallbackClass.getCanonicalName()));
+				}
+				BlockClassRegistry.updateFallbackFor(fallbackClass, fallback,
+						cachedMethod);
+			}
+			else {
+				throw new IllegalStateException(String.format(
+						"Cannot find method [%s] in class [%s] with parameters %s in degrade",
+						fallback, fallbackClass.getCanonicalName(), Arrays.asList(args)));
+			}
 		}
 		return cachedMethod;
 	}
@@ -124,10 +167,24 @@ public class SentinelProtectInterceptor implements ClientHttpRequestInterceptor 
 			return null;
 		}
 		Method cachedMethod = BlockClassRegistry.lookupBlockHandler(blockClass, block);
+		Class[] args = new Class[] { HttpRequest.class, byte[].class,
+				ClientHttpRequestExecution.class, BlockException.class };
 		if (cachedMethod == null) {
-			cachedMethod = ClassUtils.getStaticMethod(blockClass, block,
-					BlockException.class);
-			BlockClassRegistry.updateBlockHandlerFor(blockClass, block, cachedMethod);
+			cachedMethod = ClassUtils.getStaticMethod(blockClass, block, args);
+			if (cachedMethod != null) {
+				if (!ClientHttpResponse.class
+						.isAssignableFrom(cachedMethod.getReturnType())) {
+					throw new IllegalStateException(String.format(
+							"the return type of method [%s] in class [%s] is not ClientHttpResponse in flow control",
+							cachedMethod.getName(), blockClass.getCanonicalName()));
+				}
+				BlockClassRegistry.updateBlockHandlerFor(blockClass, block, cachedMethod);
+			}
+			else {
+				throw new IllegalStateException(String.format(
+						"Cannot find method [%s] in class [%s] with parameters %s in flow control",
+						block, blockClass.getCanonicalName(), Arrays.asList(args)));
+			}
 		}
 		return cachedMethod;
 	}

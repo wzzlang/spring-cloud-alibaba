@@ -37,4 +37,5 @@ public class NacosConfigBootstrapConfiguration {
 	public NacosConfigProperties nacosConfigProperties() {
 		return new NacosConfigProperties();
 	}
+
 }

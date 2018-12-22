@@ -1,6 +1,5 @@
 package org.springframework.cloud.alibaba.sentinel.custom;
 
-import java.io.IOException;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -9,6 +8,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -17,16 +17,20 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.support.BeanDefinitionBuilder;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.boot.context.event.ApplicationStartedEvent;
+import org.springframework.cloud.alibaba.sentinel.SentinelConstants;
 import org.springframework.cloud.alibaba.sentinel.SentinelProperties;
+import org.springframework.cloud.alibaba.sentinel.datasource.SentinelDataSourceConstants;
 import org.springframework.cloud.alibaba.sentinel.datasource.config.AbstractDataSourceProperties;
+import org.springframework.cloud.alibaba.sentinel.datasource.config.DataSourcePropertiesConfiguration;
+import org.springframework.cloud.alibaba.sentinel.datasource.config.NacosDataSourceProperties;
 import org.springframework.cloud.alibaba.sentinel.datasource.converter.JsonConverter;
 import org.springframework.cloud.alibaba.sentinel.datasource.converter.XmlConverter;
 import org.springframework.context.event.EventListener;
 import org.springframework.util.CollectionUtils;
 import org.springframework.util.ReflectionUtils;
-import org.springframework.util.ResourceUtils;
 import org.springframework.util.StringUtils;
 
+import com.alibaba.csp.sentinel.datasource.AbstractDataSource;
 import com.alibaba.csp.sentinel.datasource.ReadableDataSource;
 import com.alibaba.csp.sentinel.property.SentinelProperty;
 import com.alibaba.csp.sentinel.slots.block.authority.AuthorityRule;
@@ -35,6 +39,8 @@ import com.alibaba.csp.sentinel.slots.block.degrade.DegradeRule;
 import com.alibaba.csp.sentinel.slots.block.degrade.DegradeRuleManager;
 import com.alibaba.csp.sentinel.slots.block.flow.FlowRule;
 import com.alibaba.csp.sentinel.slots.block.flow.FlowRuleManager;
+import com.alibaba.csp.sentinel.slots.block.flow.param.ParamFlowRule;
+import com.alibaba.csp.sentinel.slots.block.flow.param.ParamFlowRuleManager;
 import com.alibaba.csp.sentinel.slots.system.SystemRule;
 import com.alibaba.csp.sentinel.slots.system.SystemRuleManager;
 
@@ -55,7 +61,7 @@ public class SentinelDataSourceHandler {
 	private List<String> dataTypeList = Arrays.asList("json", "xml");
 
 	private List<Class> rulesList = Arrays.asList(FlowRule.class, DegradeRule.class,
-			SystemRule.class, AuthorityRule.class);
+			SystemRule.class, AuthorityRule.class, ParamFlowRule.class);
 
 	private List<String> dataSourceBeanNameList = Collections
 			.synchronizedList(new ArrayList<>());
@@ -73,51 +79,42 @@ public class SentinelDataSourceHandler {
 		DefaultListableBeanFactory beanFactory = (DefaultListableBeanFactory) event
 				.getApplicationContext().getAutowireCapableBeanFactory();
 
+		// commercialization
+		if (!StringUtils.isEmpty(System.getProperties()
+				.getProperty(SentinelDataSourceConstants.NACOS_DATASOURCE_ENDPOINT))) {
+			Map<String, DataSourcePropertiesConfiguration> newDataSourceMap = new TreeMap<>(
+					String.CASE_INSENSITIVE_ORDER);
+			for (Map.Entry<String, DataSourcePropertiesConfiguration> entry : sentinelProperties
+					.getDatasource().entrySet()) {
+				if (entry.getValue().getValidDataSourceProperties()
+						.getClass() != NacosDataSourceProperties.class) {
+					newDataSourceMap.put(entry.getKey(), entry.getValue());
+				}
+			}
+			newDataSourceMap.put(SentinelConstants.FLOW_DATASOURCE_NAME,
+					new DataSourcePropertiesConfiguration(
+							NacosDataSourceProperties.buildFlowByEDAS()));
+			newDataSourceMap.put(SentinelConstants.DEGRADE_DATASOURCE_NAME,
+					new DataSourcePropertiesConfiguration(
+							NacosDataSourceProperties.buildDegradeByEDAS()));
+			sentinelProperties.setDatasource(newDataSourceMap);
+		}
+
 		sentinelProperties.getDatasource()
 				.forEach((dataSourceName, dataSourceProperties) -> {
-					if (dataSourceProperties.getInvalidField().size() != 1) {
+					List<String> validFields = dataSourceProperties.getValidField();
+					if (validFields.size() != 1) {
 						logger.error("[Sentinel Starter] DataSource " + dataSourceName
 								+ " multi datasource active and won't loaded: "
-								+ dataSourceProperties.getInvalidField());
+								+ dataSourceProperties.getValidField());
 						return;
 					}
-					Optional.ofNullable(dataSourceProperties.getFile())
-							.ifPresent(file -> {
-								try {
-									dataSourceProperties.getFile().setFile(ResourceUtils
-											.getFile(StringUtils.trimAllWhitespace(
-													dataSourceProperties.getFile()
-															.getFile()))
-											.getAbsolutePath());
-								}
-								catch (IOException e) {
-									logger.error("[Sentinel Starter] DataSource "
-											+ dataSourceName + " handle file error: "
-											+ e.getMessage());
-									throw new RuntimeException(
-											"[Sentinel Starter] DataSource "
-													+ dataSourceName
-													+ " handle file error: "
-													+ e.getMessage(),
-											e);
-								}
-								registerBean(beanFactory, file,
-										dataSourceName + "-sentinel-file-datasource");
-							});
-					Optional.ofNullable(dataSourceProperties.getNacos())
-							.ifPresent(nacos -> {
-								registerBean(beanFactory, nacos,
-										dataSourceName + "-sentinel-nacos-datasource");
-							});
-					Optional.ofNullable(dataSourceProperties.getApollo())
-							.ifPresent(apollo -> {
-								registerBean(beanFactory, apollo,
-										dataSourceName + "-sentinel-apollo-datasource");
-							});
-					Optional.ofNullable(dataSourceProperties.getZk()).ifPresent(zk -> {
-						registerBean(beanFactory, zk,
-								dataSourceName + "-sentinel-zk-datasource");
-					});
+
+					AbstractDataSourceProperties abstractDataSourceProperties = dataSourceProperties
+							.getValidDataSourceProperties();
+					abstractDataSourceProperties.preCheck();
+					registerBean(beanFactory, abstractDataSourceProperties, dataSourceName
+							+ "-sentinel-" + validFields.get(0) + "-datasource");
 				});
 
 		dataSourceBeanNameList.forEach(beanName -> {
@@ -146,8 +143,11 @@ public class SentinelDataSourceHandler {
 				else if (ruleType == SystemRule.class) {
 					SystemRuleManager.register2Property(sentinelProperty);
 				}
-				else {
+				else if (ruleType == AuthorityRule.class) {
 					AuthorityRuleManager.register2Property(sentinelProperty);
+				}
+				else {
+					ParamFlowRuleManager.register2Property(sentinelProperty);
 				}
 			}
 		});
@@ -246,14 +246,26 @@ public class SentinelDataSourceHandler {
 				}
 				else {
 					// wired properties
-					builder.addPropertyValue(propertyName, propertyValue);
+					Optional.ofNullable(propertyValue)
+							.ifPresent(v -> builder.addPropertyValue(propertyName, v));
 				}
 			}
 		});
 
 		beanFactory.registerBeanDefinition(dataSourceName, builder.getBeanDefinition());
 		// init in Spring
-		beanFactory.getBean(dataSourceName);
+		AbstractDataSource newDataSource = (AbstractDataSource) beanFactory
+				.getBean(dataSourceName);
+		// commercialization
+		if (!StringUtils.isEmpty(System.getProperties()
+				.getProperty(SentinelDataSourceConstants.NACOS_DATASOURCE_ENDPOINT))) {
+			if (dataSourceName.contains(SentinelConstants.FLOW_DATASOURCE_NAME)) {
+				FlowRuleManager.register2Property(newDataSource.getProperty());
+			}
+			else if (dataSourceName.contains(SentinelConstants.DEGRADE_DATASOURCE_NAME)) {
+				DegradeRuleManager.register2Property(newDataSource.getProperty());
+			}
+		}
 		dataSourceBeanNameList.add(dataSourceName);
 	}
 

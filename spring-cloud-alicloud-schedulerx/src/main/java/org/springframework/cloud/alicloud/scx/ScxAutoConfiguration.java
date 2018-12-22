@@ -14,24 +14,16 @@
  * limitations under the License.
  */
 
-package org.springframework.cloud.alibaba.sentinel.annotation;
+package org.springframework.cloud.alicloud.scx;
 
-import java.lang.annotation.*;
+import org.springframework.context.annotation.Configuration;
 
 /**
- * @author fangjian
+ * placeholder configuration
+ *
+ * @author xiaolongzuo
  */
-@Target({ ElementType.METHOD })
-@Retention(RetentionPolicy.RUNTIME)
-@Documented
-public @interface SentinelProtect {
-
-	String blockHandler() default "";
-
-	Class<?> blockHandlerClass() default void.class;
-
-	String fallback() default "";
-
-	Class<?> fallbackClass() default void.class;
+@Configuration
+public class ScxAutoConfiguration {
 
 }
